@@ -1,0 +1,14 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.dll
+
+# C extensions
+*.so
+
+# VS Code
+.vscode/
+
+# Scan results
+.avi
+.gwy
