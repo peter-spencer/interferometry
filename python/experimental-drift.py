@@ -1,5 +1,20 @@
 # Process an AVI movie collected by a white light interferometer
-# Peter Spencer Feb 2022
+# Peter Spencer March 2022
+
+# This version of the script is an experiment to see if the frequency data of the interference
+# fringes can be used to track the Z position throughout the scan, and then used to correct for
+# drift during the measurement.
+# 
+# For this to work well the sample being scanned should be a on a slight tilt, enough that there
+# is a continuous set of data points from the lowest important feature to the highest.
+#
+# Analysing the rate of change of the phase of Hilbert analytic allows the frequency of the
+# interference fringes to be measured. This is done here by a linear fit to the phase in a
+# narrow window around the centre of each interference pattern. The large number of these
+# frequency samples is then distilled by binning and taking the median of each bin to construct
+# a calibration curve for the `real` Z-position as a function of the scan Z-position.
+#
+# This calibration curve is then applied to the Z height data by linear interpolation.
 
 ## Input file information
 filename = "output.avi"
@@ -12,12 +27,12 @@ gwy_palette = 'Spectral'
 gwy_palette_layers = 'Gray'
 
 ## Initial estimates to start fitting process with
-wavelength = 650e-9             # Interference fringe dominant wavelength                   [metres]
+wavelength = 600e-9             # Interference fringe dominant wavelength                   [metres]
 wavelength_lowest = 550e-9      # Lower bound on dominant wavelength                        [metres]
 wavelength_highest = 650e-9     # Upper bound on dominant wavelength                        [metres]
 width_estimate = 600e-9         # Coherence length of intensity envelope                    [metres]
 width_lowest = 250e-9           # Lower bound on coherence length                           [metres]
-width_highest = 1.00e-6         # Upper bound on coherence length                           [metres]
+width_highest = 1.50e-6         # Upper bound on coherence length                           [metres]
 intensity_lowest = 0            # Lower bound on peak intensity                             [arbitrary units]
 intensity_highest = 255         # Upper bound on peak intensity                             [arbitrary units]
 offset_lowest = 0               # Lower bound on background intensity                       [arbitrary units]
@@ -32,7 +47,7 @@ refractive_index = 1.65         # Optical constant of thin-film between reflecti
 
 ## Other settings
 verbose = False                 # Descriptive text messages (True) or progress bar (False)  [boolean]
-analysis_steps = 10             # Number of waypoints in the analysis process               [number]
+analysis_steps = 11             # Number of waypoints in the analysis process               [number]
 
 ###########################################################################################
 #### Import libraries and define helper functions                                      ####
@@ -99,7 +114,7 @@ _hilbert_kernel = cp.ElementwiseKernel(
                    static_cast<int>( 0.5 * _ind.size() );",
 )
 
-
+# Free up memory from the GPU, the FFT plan cache needs to be cleared for allocation to succeed
 def gpu_clear():
     cp.fft.config.get_plan_cache().clear()
 
@@ -142,27 +157,51 @@ def split_hilbert(x, d=10):
     h = h[tuple(ind)]
 
     a = x.shape[0] // 10
-    hdata = np.zeros_like(x)
+    hdata = np.zeros_like(x, dtype=np.complex64)
 
     for b in range(d):
         st = b*a
         sp = (b+1)*a
 
         Xf = cp.fft.fft(rdata[st:sp])
-        hdata[st:sp] = cp.asnumpy(cp.abs(cp.fft.ifft(Xf * h)))
+        hdata[st:sp] = cp.asnumpy(cp.fft.ifft(Xf * h))
 
     gpu_clear()
 
     return hdata
 
-###########################################################################################################
-###########################################################################################################
-###########################################################################################################
+# Quick and dirty phase unwrapping for speed
+def quick_unwrap(phase_data, preserve_input=True):
+    if preserve_input:
+        b = np.copy(phase_data)
+    else:
+        b = phase_data
+    b[:,1:] -= b[:,:-1]
+    b += 2*np.pi * (b < -np.pi)
+    b -= 2*np.pi * (b > np.pi)
+    return np.float32(np.cumsum(b, axis=1))
 
+# This function selects windows of data around specific centre indices
+def select_from(data, centres, half_width):
+    # Create an array of indices for selecting the data to be fitted to
+    idxs = np.tile(np.expand_dims(np.int32(centres),axis=1),(1,2*half_width))
+    idxs += np.expand_dims(np.arange(-half_width,half_width,1),axis=0)
+
+    # Identify bad ranges that overlap the beginning/end of the data range
+    mask = np.any((np.max(idxs,axis=1) >= data.shape[1], np.min(idxs,axis=1) < 0), axis=0)
+
+    # Remove any invalid index ranges
+    t = np.delete(data, mask, axis=0)
+    idxs = np.delete(idxs, mask, axis=0)
+    x = np.delete(centres, mask, axis=0)
+
+    # Get the data to be fitted to from the first peaks
+    y = np.take_along_axis(t,idxs,axis=1)
+
+    return x,y
+
+###########################################################################################################
 ######################################### Main Script starts here #########################################
-
-###########################################################################################################
-###########################################################################################################
 ###########################################################################################################
 
 all_start = time.perf_counter()
@@ -195,7 +234,7 @@ idx = 0
 while success:
 
     # Update progress
-    printProgressBar(idx, length, prefix="Read", suffix="frames", decimals=0)
+    printProgressBar(idx, length, prefix="Read", decimals=0)
 
     # Store the processed frame in the image buffer
     image_buffer[:,:,idx] = image_raw[:,:,colour_channel]
@@ -317,7 +356,7 @@ fstart = time.perf_counter()
 
 # This Fourier transform is being calculated to detect interference fringes that were not
 # removed from the intensity envelope (this "bleed-through" happend because of stray light)
-hf = cp.asnumpy(cp.fft.rfft(cp.asarray(hs)))
+hf = cp.asnumpy(cp.fft.rfft(cp.asarray(np.abs(hs))))
 
 ibf = np.sum(np.abs(fdata)[:,ifstart:ifend], axis=1)
 ihf = np.sum(np.abs(hf)[:,ifstart:ifend], axis=1)
@@ -340,15 +379,15 @@ else:
 if verbose:
     print('Fit to both peaks simultaneously...')
 
-intensity_first = np.argmax(hs, axis=1)
+intensity_first = np.argmax(np.abs(hs), axis=1)
 
 # initial parameters estimation
 g_positionA = np.float32(intensity_first)
-g_amplitudeA = np.float32(np.max(hs, axis=1))
+g_amplitudeA = np.float32(np.max(np.abs(hs), axis=1))
 g_widthA = np.float32(np.tile(width_estimate/z_step, (pixels,)))
 
 g_positionB = np.float32(intensity_first + 3e-6/z_step)
-g_amplitudeB = np.float32(np.max(hs, axis=1))
+g_amplitudeB = np.float32(np.max(np.abs(hs), axis=1))
 g_widthB = np.float32(np.tile(width_estimate/z_step, (pixels,)))
 
 g_offset = np.float32(np.zeros((pixels,)))
@@ -376,7 +415,7 @@ constraints_type = np.int32(np.array([3,3,3,3,3,3,3]))
 
 constraints = np.tile(constraints_each, (data.shape[0],1))
 
-parameters, states, chi_squares_height, number_iterations, execution_time = gf.fit_constrained(hs, None,
+parameters, states, chi_squares_height, number_iterations, execution_time = gf.fit_constrained(np.abs(hs), None,
     gf.ModelID.GAUSS_1D_TWIN, initial_parameters, parameters_to_fit=to_fit,
     constraints=constraints, constraint_types=constraints_type)
 
@@ -479,6 +518,58 @@ else:
     printProgressBar(analysis_step, analysis_steps, prefix="Analysis", decimals=0)
 
 ###########################################################################################
+#### Calibrate Z position and drift using Hilbert analytic's instantaneous frequency   ####
+###########################################################################################
+
+if verbose:
+    print('Starting calculation of Z position and drift...')
+
+hstart = time.perf_counter()
+
+# Decide the number of datapoints required for a good fit to the instantaneous frequency
+med_width = np.int32(np.median(parameters[:,2]))
+
+kA,sA = select_from(hs, parameters[:,1], med_width)
+kB,sB = select_from(hs, parameters[:,5], med_width)
+
+sx = np.concatenate((kA, kB), axis=0)
+s = np.concatenate((sA, sB), axis=0)
+
+# Get the phase of the Hilbert analytic for the selected data ranges
+s = quick_unwrap(np.angle(s), preserve_input=False)
+
+# Fit control parameters for GPU fitting of the instantaneous frequency
+initial_parameters = np.float32(np.zeros((s.shape[0],2)))
+to_fit = np.int32(np.array([1,1]))
+
+# Do the GPU fitting
+parameters_cal, states, chi_squares_height, number_iterations, execution_time = gf.fit(s, None,
+     gf.ModelID.LINEAR_1D, initial_parameters, parameters_to_fit=to_fit)
+
+# Binning the fit results into Z height ranges in preparation for median averaging
+el = [ [] for _ in range(length) ]
+for idx in range(parameters_cal.shape[0]):
+    el[np.int32(np.round(sx[idx]))].append(parameters_cal[idx,1])
+
+# Get the median value of each Z-bin
+yr = np.ones((length)) * wavelength
+for idx in range(length):
+    if len(el[idx]) > 10:
+        yr[idx] = 1 / (np.median(el[idx]) / (4*np.pi) / z_step)
+
+# Construct the Z calibration data in units of Z steps
+z_uncal = np.linspace(0,data.shape[1],num=data.shape[1])
+z_cal = np.cumsum(wavelength / yr)
+
+hend = time.perf_counter()
+
+if verbose:
+    print("Z drift calculations took %g seconds."%(hend-hstart))
+else:
+    analysis_step += 1
+    printProgressBar(analysis_step, analysis_steps, prefix="Analysis", decimals=0)
+
+###########################################################################################
 #### Sort the results and save the data                                                ####
 ###########################################################################################
 
@@ -486,28 +577,49 @@ else:
 
 layer_top = np.zeros_like(image_first)
 layer_bottom = np.zeros_like(image_first)
+wavelength_top = np.zeros_like(image_first)
+wavelength_bottom = np.zeros_like(image_first)
 
 for idx in range(pixels):
     if layer_count[idx] == 1:
         layer_top[idx] = image_first[idx]
         layer_bottom[idx] = image_first[idx]
+        wavelength_top[idx] = parameters_two[idx,2]
+        wavelength_bottom[idx] = parameters_two[idx,2]
     elif image_first[idx] > image_second[idx]:
         layer_top[idx] = image_first[idx]
         layer_bottom[idx] = image_second[idx]
+        wavelength_top[idx] = parameters_two[idx,2]
+        wavelength_bottom[idx] = parameters_three[idx,2]
     else:
         layer_top[idx] = image_second[idx]
         layer_bottom[idx] = image_first[idx]
+        wavelength_top[idx] = parameters_three[idx,2]
+        wavelength_bottom[idx] = parameters_two[idx,2]
+
+
+layer_top = np.interp(layer_top, z_uncal, z_cal)
+layer_bottom = np.interp(layer_bottom, z_uncal, z_cal)
 
 # Prepare the image arrays for saving
 layer_top = np.float64(np.reshape(layer_top*z_step,(frame_width,frame_height)))
 layer_bottom = np.float64(np.reshape(layer_bottom*z_step,(frame_width,frame_height)))
 layer_count = np.float64(np.reshape(layer_count,(frame_width,frame_height)))
 
+wavelength_top = np.float64(np.reshape(wavelength_top*z_step,(frame_width,frame_height)))
+wavelength_bottom = np.float64(np.reshape(wavelength_bottom*z_step,(frame_width,frame_height)))
+
 # Derived measurements
 layer_delta = layer_top - layer_bottom
 substrate = layer_top - layer_delta/refractive_index
 
 # Write the analysis results to the Gwyddion file
+
+if verbose:
+    print('Writing complete analysis data to output file.')
+else:
+    analysis_step += 1
+    printProgressBar(analysis_step, analysis_steps, prefix="Analysis", decimals=0)
 
 # Create a Gwyddion file object to save results into
 obj = GwyContainer()
@@ -532,15 +644,16 @@ obj['/5/data/title'] = 'Substrate surface (n=%g)'%(refractive_index)
 obj['/5/base/palette'] = gwy_palette
 obj['/5/data'] =  GwyDataField(substrate, xreal=frame_width, si_unit_xy='m', yreal=frame_height, si_unit_z='m')
 
+obj['/6/data/title'] = 'Wavelength (top)'
+obj['/6/base/palette'] = gwy_palette
+obj['/6/data'] =  GwyDataField(wavelength_top, xreal=frame_width, si_unit_xy='m', yreal=frame_height, si_unit_z='m')
+
+obj['/7/data/title'] = 'Wavelength (bottom)'
+obj['/7/base/palette'] = gwy_palette
+obj['/7/data'] =  GwyDataField(wavelength_bottom, xreal=frame_width, si_unit_xy='m', yreal=frame_height, si_unit_z='m')
+
 # Export the data results
 obj.tofile(output_filename)
-
-###########################################################################################
-#### Analysis completed                                                                ####
-###########################################################################################
-
-printProgressBar(analysis_steps, analysis_steps, prefix="Analysis", decimals=0)
-print('')
 
 all_done = time.perf_counter()
 print('Processing completed in %g seconds'%(all_done-all_start))
