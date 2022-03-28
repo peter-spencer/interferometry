@@ -227,7 +227,7 @@ frame_height = image_raw.shape[1]
 pixels = frame_width * frame_height
 
 # Allocate buffer variables
-image_buffer = np.zeros((frame_width,frame_height,length), dtype='f4')
+image_buffer = cp.zeros((frame_width,frame_height,length), dtype='f4')
 
 # Loop over every frame in the source file
 idx = 0
@@ -237,7 +237,7 @@ while success:
     printProgressBar(idx, length, prefix="Read", decimals=0)
 
     # Store the processed frame in the image buffer
-    image_buffer[:,:,idx] = image_raw[:,:,colour_channel]
+    image_buffer[:,:,idx] = cp.asarray(image_raw[:,:,colour_channel])
 
     # Read the next frame
     idx += 1
@@ -257,16 +257,16 @@ else:
     printProgressBar(analysis_step, analysis_steps, prefix="Analysis", decimals=0)
 
 # Organise the data into a shape suitable for fitting to each pixel in parallel
-data = np.reshape(image_buffer,(pixels,length))
+data = cp.reshape(image_buffer,(pixels,length))
 
 # Get an array of the average intensities of each pixel
-norm = np.mean(data, axis=1, keepdims=True)
+norm = cp.mean(data, axis=1, keepdims=True)
 
 # Normalise each pixel to have the same average intensity
 data_normed = data / norm
 
 # Calculate the median pixel at each Z height to calculate the common background signal
-med = np.median(data_normed, axis=0, keepdims=True)
+med = cp.median(data_normed, axis=0, keepdims=True)
 
 # Subtract the common background signal from each pixel in the original data
 data -= med * norm
@@ -284,7 +284,7 @@ else:
 fstart = time.perf_counter()
 
 # Take the real-valued Fourier transform along Z for each pixel
-fdata = cp.asnumpy(cp.fft.rfft(cp.asarray(data)))
+fdata = cp.asnumpy(cp.fft.rfft(data))
 
 fend = time.perf_counter()
 
@@ -297,21 +297,23 @@ else:
 
 fstart = time.perf_counter()
 
-f = np.linspace(0,data.shape[1]*z_step/4 / 1e-9,num=501, endpoint=True)
+# f = np.linspace(0,data.shape[1]*z_step/4 / 1e-9,num=501, endpoint=True)
 
 ifstart = np.int32(wavelength*layer_detect_low / z_step * 2)
 ifend = np.int32(wavelength*layer_detect_high / z_step * 2)
 
-fringex = f[ifstart:ifend]
-fringes = fdata[:,ifstart:ifend]
+# fringex = f[ifstart:ifend]
+fringes = np.abs(fdata[:,ifstart:ifend])
+fringes /= np.max(fringes, axis=1)
 
 layer_count = np.zeros(data.shape[0])
-peaky = []
+# peaky = []
 for idx in range(data.shape[0]):
-    this_fringe = np.abs(fringes[idx,:])
-    this_fringe /= np.max(this_fringe)
-    peaks, _ = find_peaks(this_fringe, prominence=layer_detect_prominence, height=layer_detect_height)
-    peaky.append(peaks)
+    # this_fringe = np.abs(fringes[idx,:])
+    # this_fringe /= np.max(this_fringe)
+    # peaks, _ = find_peaks(this_fringe, prominence=layer_detect_prominence, height=layer_detect_height)
+    # peaky.append(peaks)
+    peaks, _ = find_peaks(fringes[idx], prominence=layer_detect_prominence, height=layer_detect_height)
     layer_count[idx] = np.where(len(peaks) > 1, 2, 1)
 
 fend = time.perf_counter()
@@ -358,8 +360,8 @@ fstart = time.perf_counter()
 # removed from the intensity envelope (this "bleed-through" happend because of stray light)
 hf = cp.asnumpy(cp.fft.rfft(cp.asarray(np.abs(hs))))
 
-ibf = np.sum(np.abs(fdata)[:,ifstart:ifend], axis=1)
-ihf = np.sum(np.abs(hf)[:,ifstart:ifend], axis=1)
+ibf = np.sum(np.abs(fdata[:,ifstart:ifend]), axis=1)
+ihf = np.sum(np.abs(hf[:,ifstart:ifend]), axis=1)
 stray_ratio = ihf / ibf                                 # Estimate of the stray light fraction
 
 gpu_clear()
