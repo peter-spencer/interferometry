@@ -17,9 +17,10 @@
 # This calibration curve is then applied to the Z height data by linear interpolation.
 
 ## Input file information
-filename = "output.avi"
+filename = "../projector-lithography/output.avi"
+filename = "../interferometry/output.avi"
 colour_channel = 0              # 0 for greyscale AVI data                                  [channel number]
-z_step = 20e-9                  # Step size between scan frames                             [metres]
+z_step = 20e-9 * 1.0607         # Step size between scan frames and calibration factor      [metres]
 
 ## Output file settings
 output_filename = 'output.gwy'
@@ -60,6 +61,8 @@ from gwyfile.objects import GwyContainer, GwyDataField
 import cv2
 import pygpufit.gpufit as gf
 import cupy as cp
+
+from matplotlib import pyplot as plt
 
 # Print iterations progress
 def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
@@ -419,6 +422,12 @@ parameters, states, chi_squares_height, number_iterations, execution_time = gf.f
     gf.ModelID.GAUSS_1D_TWIN, initial_parameters, parameters_to_fit=to_fit,
     constraints=constraints, constraint_types=constraints_type)
 
+# print("Number of iterations = %d"%(np.max(number_iterations)))
+# print("Execution time = %g"%(execution_time))
+# print("States example = %d"%(np.min(states)))
+# print("States example = %d"%(np.max(states)))
+# print('')
+# print('')
 gpu_clear()
 
 if verbose:
@@ -563,6 +572,9 @@ z_cal = np.cumsum(wavelength / yr)
 
 hend = time.perf_counter()
 
+plt.plot(z_uncal,z_cal,'b.')
+plt.show()
+
 if verbose:
     print("Z drift calculations took %g seconds."%(hend-hstart))
 else:
@@ -602,6 +614,11 @@ layer_top = np.interp(layer_top, z_uncal, z_cal)
 layer_bottom = np.interp(layer_bottom, z_uncal, z_cal)
 
 # Prepare the image arrays for saving
+
+# layer_top = parameters_two[:,1] + parameters_two[:,2]*parameters_two[:,4]/4/np.pi
+# layer_bottom = parameters_two[:,1]
+# layer_top = intensity_first + 1000
+
 layer_top = np.float64(np.reshape(layer_top*z_step,(frame_width,frame_height)))
 layer_bottom = np.float64(np.reshape(layer_bottom*z_step,(frame_width,frame_height)))
 layer_count = np.float64(np.reshape(layer_count,(frame_width,frame_height)))
